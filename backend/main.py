@@ -1,40 +1,38 @@
-import asyncio,base64,json,math,random,time
+import asyncio,base64,json,math,os,random,time
 from fastapi import FastAPI,WebSocket,WebSocketDisconnect,File,UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import numpy as np,cv2
 
 app=FastAPI(title="SkySentry API",version="3.0.0")
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 W,H=1280,720
 
-# Load model at import time (already downloaded in Docker build)
 _model=None
 try:
+    os.environ["YOLO_VERBOSE"]="False"
+    import torch
+    torch.serialization.add_safe_globals([])
     from ultralytics import YOLO
-    import os; os.environ["YOLO_VERBOSE"]="False"
-    _model=YOLO("yolov8n.pt")
-    _model(np.zeros((320,320,3),dtype=np.uint8),verbose=False)  # warmup
-    print("[YOLO] ready")
+    _model=YOLO("/app/yolov8n.pt")
+    _model(np.zeros((320,320,3),dtype=np.uint8),verbose=False)
+    print("[YOLO] loaded /app/yolov8n.pt OK")
 except Exception as e:
     print(f"[YOLO] failed: {e}")
 
-REMAP={
-    "airplane":"fixed-wing-drone","bird":"micro-UAV","kite":"tethered-UAV",
-    "helicopter":"rotary-UAV","frisbee":"disc-UAV","sports ball":"spherical-drone",
-    "person":"ground-operator","car":"ground-vehicle","truck":"convoy-vehicle",
-    "motorcycle":"scout-unit","bicycle":"recon-unit","backpack":"payload-carrier",
-    "cell phone":"comms-device","laptop":"command-terminal","boat":"watercraft-threat",
-}
-AERIAL={"fixed-wing-drone","micro-UAV","tethered-UAV","rotary-UAV","disc-UAV","spherical-drone","drone","uav","quadcopter","hexcopter"}
+REMAP={"airplane":"fixed-wing-drone","bird":"micro-UAV","kite":"tethered-UAV",
+       "helicopter":"rotary-UAV","frisbee":"disc-UAV","sports ball":"spherical-drone",
+       "person":"ground-operator","car":"ground-vehicle","truck":"convoy-vehicle",
+       "motorcycle":"scout-unit","boat":"watercraft-threat","backpack":"payload-carrier"}
+AERIAL={"fixed-wing-drone","micro-UAV","tethered-UAV","rotary-UAV",
+        "disc-UAV","spherical-drone","drone","uav","quadcopter","hexcopter"}
 
 def run_yolo(img,conf=0.18):
-    if _model is None: return []
+    if _model is None:return[]
     res=_model(img,conf=conf,verbose=False)[0]
     out=[]
     for b in res.boxes:
-        raw=_model.names[int(b.cls[0])]
-        label=REMAP.get(raw,raw)
+        raw=_model.names[int(b.cls[0])];label=REMAP.get(raw,raw)
         x1,y1,x2,y2=map(int,b.xyxy[0].tolist())
         out.append({"bbox":[x1,y1,x2,y2],"conf":round(float(b.conf[0]),3),
                     "class":label,"raw_class":raw,"is_aerial":label in AERIAL,
@@ -48,7 +46,8 @@ def annotate(img,dets):
         cv2.rectangle(img,(x1,y1),(x2,y2),c,2)
         cs=16
         for(px,py),(dx1,dy1),(dx2,dy2) in[((x1,y1),(cs,0),(0,cs)),((x2,y1),(-cs,0),(0,cs)),((x1,y2),(cs,0),(0,-cs)),((x2,y2),(-cs,0),(0,-cs))]:
-            cv2.line(img,(px,py),(px+dx1,py+dy1),c,2);cv2.line(img,(px,py),(px+dx2,py+dy2),c,2)
+            cv2.line(img,(px,py),(px+dx1,py+dy1),c,2)
+            cv2.line(img,(px,py),(px+dx2,py+dy2),c,2)
         lbl=f"{d['class']}  {d['conf']:.0%}"
         (tw,th),_=cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,.55,1)
         cv2.rectangle(img,(x1,y1-th-8),(x1+tw+6,y1),(10,10,10),-1)
@@ -72,9 +71,8 @@ def root():
 async def detect_image(file:UploadFile=File(...),conf:float=0.18):
     data=await file.read()
     img=cv2.imdecode(np.frombuffer(data,np.uint8),cv2.IMREAD_COLOR)
-    if img is None: return JSONResponse({"error":"bad image"},400)
-    dets=run_yolo(img,conf)
-    ann=annotate(img.copy(),dets)
+    if img is None:return JSONResponse({"error":"bad image"},400)
+    dets=run_yolo(img,conf);ann=annotate(img.copy(),dets)
     return{"filename":file.filename,"shape":list(img.shape[:2]),"detections":dets,
            "count":len(dets),"aerial_count":len([d for d in dets if d["is_aerial"]]),
            "status":"THREAT DETECTED" if dets else "ALL CLEAR","annotated_b64":enc(ann)}
@@ -82,16 +80,16 @@ async def detect_image(file:UploadFile=File(...),conf:float=0.18):
 @app.post("/detect/video")
 async def detect_video(file:UploadFile=File(...),conf:float=0.18,every_n:int=5):
     data=await file.read()
-    tmp=f"/tmp/{file.filename}"
-    with open(tmp,"wb") as f: f.write(data)
+    tmp=f"/tmp/upload_{int(time.time())}"
+    with open(tmp,"wb") as f:f.write(data)
     cap=cv2.VideoCapture(tmp)
-    if not cap.isOpened(): return JSONResponse({"error":"bad video"},400)
+    if not cap.isOpened():return JSONResponse({"error":"bad video"},400)
     fps=cap.get(cv2.CAP_PROP_FPS) or 30
     total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames,fi=[],0
     while True:
         ret,frame=cap.read()
-        if not ret: break
+        if not ret:break
         if fi%every_n==0:
             dets=run_yolo(frame,conf)
             frames.append({"frame_idx":fi,"timestamp_s":round(fi/fps,3),"detections":dets,"count":len(dets)})
@@ -109,15 +107,14 @@ async def ws_webcam(ws:WebSocket):
             b64=json.loads(msg).get("frame","")
             try:
                 img=cv2.imdecode(np.frombuffer(base64.b64decode(b64),np.uint8),cv2.IMREAD_COLOR)
-                if img is None: raise ValueError("bad frame")
-                dets=run_yolo(img,0.18)
-                ann=annotate(img.copy(),dets)
+                if img is None:raise ValueError("bad frame")
+                dets=run_yolo(img,0.18);ann=annotate(img.copy(),dets)
                 await ws.send_text(json.dumps({"detections":dets,"count":len(dets),
                     "status":"THREAT DETECTED" if dets else "ALL CLEAR",
                     "annotated":enc(ann),"ts":int(time.time()*1000)}))
             except Exception as e:
                 await ws.send_text(json.dumps({"error":str(e),"count":0,"detections":[],"annotated":""}))
-    except WebSocketDisconnect: pass
+    except WebSocketDisconnect:pass
 
 class KF:
     _c=0
