@@ -14,9 +14,9 @@ try:
     import torch
     torch.serialization.add_safe_globals([])
     from ultralytics import YOLO
-    _model=YOLO("/app/yolov8n.pt")
+    _model=YOLO("/app/drone_model.pt")
     _model(np.zeros((320,320,3),dtype=np.uint8),verbose=False)
-    print("[YOLO] loaded /app/yolov8n.pt OK")
+    print("[YOLO] loaded /app/drone_model.pt OK")
 except Exception as e:
     print(f"[YOLO] failed: {e}")
 
